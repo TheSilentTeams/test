@@ -20,13 +20,16 @@ TERA_COOKIE = os.getenv("TERA_COOKIE")
 LOG_CHANNEL = int(os.getenv("LOG_CHANNEL"))
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
+
 TERABOX_DOMAINS = [
     "terabox.com", "terabox.app", "1024tera.com", "terasharelink.com",
     "nephobox.com", "1024terabox.com", "4funbox.com", "mirrobox.com",
     "momerybox.com", "teraboxapp.com"
 ]
 domain_pattern = "|".join(re.escape(domain) for domain in TERABOX_DOMAINS)
-url_pattern = re.compile(rf'https?://(?:www\.)?(?:{domain_pattern})/s/\S+', re.IGNORECASE)
+url_pattern = re.compile(
+    rf'https?://(?:www\.)?(?:{domain_pattern})(?:/s/\S+|/sharing/link\?surl=\S+)',
+    re.IGNORECASE)
 
 # === DB ===
 client = Client("verif_bot", api_id, api_hash, bot_token=bot_token)
@@ -34,6 +37,7 @@ mongo = MongoClient(mongo_url)
 db = mongo["verifybot"]
 users = db["verified_users"]
 cache = {}
+
 
 def get_peer_type_new(peer_id: int) -> str:
     peer_id_str = str(peer_id)
@@ -43,11 +47,13 @@ def get_peer_type_new(peer_id: int) -> str:
         return "channel"
     return "chat"
 
+
 utils.get_peer_type = get_peer_type_new
 
 # === Verification ===
 VERIFICATION_DURATION = timedelta(hours=24)
 TOKEN_EXPIRY = timedelta(minutes=10)
+
 
 def is_verified(user_id):
     now = datetime.utcnow()
@@ -59,6 +65,7 @@ def is_verified(user_id):
         cache[user_id] = verified_at
         return now - verified_at < VERIFICATION_DURATION
     return False
+
 
 def time_left(user_id):
     if user_id in cache:
@@ -75,13 +82,20 @@ def time_left(user_id):
         return None
     return VERIFICATION_DURATION - delta
 
+
 async def send_verification_prompt(client, user_id: int, chat_id: int):
     token = secrets.token_urlsafe(16)
     now = datetime.utcnow()
     users.update_one({"user_id": user_id}, {
-        "$set": {"token": token, "token_created": now},
-        "$unset": {"verified_at": ""}
-    }, upsert=True)
+        "$set": {
+            "token": token,
+            "token_created": now
+        },
+        "$unset": {
+            "verified_at": ""
+        }
+    },
+                     upsert=True)
 
     deep_link = f"https://t.me/{client.me.username}?start=verify_{token}"
     encoded_link = urllib.parse.quote(deep_link, safe='')
@@ -99,14 +113,43 @@ async def send_verification_prompt(client, user_id: int, chat_id: int):
 
     text = "🔐 Please verify yourself by clicking below:"
     markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Verify Now", url=short_url)]]
+        [[InlineKeyboardButton("✅ Verify Now", url=short_url)]])
+    await client.send_message(chat_id,
+                              text,
+                              reply_markup=markup,
+                              disable_web_page_preview=True)
+    await client.send_message(
+        LOG_CHANNEL,
+        f"👤 [{chat_id}](tg://user?id={user_id}) requested verification\nLink: {short_url}"
     )
-    await client.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
-    await client.send_message(LOG_CHANNEL, f"👤 [{chat_id}](tg://user?id={user_id}) requested verification\nLink: {short_url}")
+
 
 # === TeraBox Downloader ===
 class DDLException(Exception):
     pass
+
+
+def normalize_link(link: str) -> str:
+    parsed = urllib.parse.urlparse(link)
+    if parsed.path.startswith("/s/"):
+        return f"https://www.terabox.com{parsed.path}"
+    elif parsed.path == "/sharing/link":
+        query = urllib.parse.parse_qs(parsed.query)
+        surl = query.get("surl", [None])[0]
+        if surl:
+            return f"https://www.terabox.com/s/{surl}"
+    raise DDLException("❌ Invalid link: could not extract 'surl'")
+
+
+def extract_key_and_path(url):
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    key = qs.get("surl", [None])[0]
+    if not key and "/s/" in parsed.path:
+        key = parsed.path.split("/s/")[-1]
+    path = urllib.parse.unquote(qs.get("path", ["/"])[0])
+    return key, path
+
 
 async def fetch(session, url):
     for _ in range(5):
@@ -117,6 +160,7 @@ async def fetch(session, url):
             await asyncio.sleep(1)
     raise DDLException(f"Failed to fetch {url}")
 
+
 async def fetch_json(session, url):
     for _ in range(5):
         try:
@@ -126,32 +170,62 @@ async def fetch_json(session, url):
             await asyncio.sleep(1)
     raise DDLException(f"Failed to fetch JSON from {url}")
 
+
+async def crawl_folder(session, jsToken, key, dir_path):
+    links = []
+    url = f"https://www.terabox.app/share/list?app_id=250528&jsToken={jsToken}&shorturl={key}&dir={dir_path}"
+    data = await fetch_json(session, url)
+    for item in data.get("list", []):
+        if str(item.get("isdir")) == "0":
+            dlink = item.get("dlink", "").replace(".com", ".app")
+            name = item.get("server_filename", "Unknown")
+            size = int(item.get("size", 0)) / (1024**2)
+            thumb = item.get("thumbs", {}).get("url3")
+            links.append((dlink, name, f"{size:.2f} MB", thumb))
+        else:
+            sub_path = item.get("path")
+            links += await crawl_folder(session, jsToken, key, sub_path)
+    return links
+
+
 async def terabox(url: str):
+    url = normalize_link(url)
     headers = {"Cookie": f"ndus={TERA_COOKIE}", "User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession(headers=headers) as session:
         _, final_url = await fetch(session, url)
-        key = final_url.split("?surl=")[-1]
-        html, _ = await fetch(session, f"http://www.terabox.com/wap/share/filelist?surl={key}")
+        key, _ = extract_key_and_path(final_url)
+        html, _ = await fetch(
+            session, f"https://www.terabox.app/wap/share/filelist?surl={key}")
         soup = BeautifulSoup(html, "lxml")
-        jsToken = next((fs.string.split("%22")[1] for fs in soup.find_all("script")
-                        if fs.string and fs.string.startswith("try {eval(decodeURIComponent") and "%22" in fs.string), None)
+        jsToken = next(
+            (fs.string.split("%22")[1] for fs in soup.find_all("script")
+             if fs.string and fs.string.startswith(
+                 "try {eval(decodeURIComponent") and "%22" in fs.string), None)
         if not jsToken:
             raise DDLException("jsToken not found in page")
-        result = await fetch_json(session, f"https://www.terabox.com/share/list?app_id=250528&jsToken={jsToken}&shorturl={key}&root=1")
-        if result["errno"] != 0:
-            raise DDLException(f"{result['errmsg']} - Check cookie")
-        items = result.get("list", [])
-        if len(items) != 1:
-            raise DDLException("Only one file allowed, or none found")
-        item = items[0]
-        if item.get("isdir") != "0":
-            raise DDLException("Folders are not supported")
-        dlink = item.get("dlink", "").replace(".com", ".app")
-        name = item.get("server_filename", "Unknown")
-        size = int(item.get("size", 0)) / (1024**2)
-        size_str = f"{size:.2f} MB"
-        thumb = item.get("thumbs", {}).get("url3")
-        return dlink, name, size_str, thumb
+        root_data = await fetch_json(
+            session,
+            f"https://www.terabox.app/share/list?app_id=250528&jsToken={jsToken}&shorturl={key}&root=1"
+        )
+        if root_data.get("errno") != 0:
+            raise DDLException("API error, check cookie or token")
+        items = root_data.get("list", [])
+        if len(items) == 1 and str(items[0].get("isdir")) == "0":
+            item = items[0]
+            dlink = item.get("dlink", "").replace(".com", ".app")
+            name = item.get("server_filename", "Unknown")
+            size = int(item.get("size", 0)) / (1024**2)
+            thumb = item.get("thumbs", {}).get("url3")
+            return [(dlink, name, f"{size:.2f} MB", thumb)]
+        results = []
+        for item in items:
+            if str(item.get("isdir")) == "1":
+                results += await crawl_folder(session, jsToken, key,
+                                              item.get("path"))
+        if not results:
+            raise DDLException("❌ No downloadable files found")
+        return results
+
 
 # === Commands ===
 @client.on_message(filters.command("start"))
@@ -161,22 +235,33 @@ async def handle_start(client, message):
     is_first = users.find_one({"user_id": message.from_user.id}) is None
 
     if is_first:
-        await client.send_message(LOG_CHANNEL, f"👤 New User: [{name}](tg://user?id={message.from_user.id}) `{message.from_user.id}`\nStarted bot.")
+        await client.send_message(
+            LOG_CHANNEL,
+            f"👤 New User: [{name}](tg://user?id={message.from_user.id}) `{message.from_user.id}`\nStarted bot."
+        )
 
     if len(args) == 2 and args[1].startswith("verify_"):
         token = args[1].split("verify_")[1]
         now = datetime.utcnow()
         user = users.find_one({"token": token})
         if not user:
-            return await message.reply("❌ Invalid or expired verification link.")
-        if "token_created" in user and now - user["token_created"] > TOKEN_EXPIRY:
+            return await message.reply(
+                "❌ Invalid or expired verification link.")
+        if "token_created" in user and now - user[
+                "token_created"] > TOKEN_EXPIRY:
             return await message.reply("❌ Verification link expired.")
         if user["user_id"] != message.from_user.id:
-            return await message.reply("❌ This link was not generated for you.")
+            return await message.reply("❌ This link was not generated for you."
+                                       )
 
         users.update_one({"user_id": user["user_id"]}, {
-            "$set": {"verified_at": now},
-            "$unset": {"token": "", "token_created": ""}
+            "$set": {
+                "verified_at": now
+            },
+            "$unset": {
+                "token": "",
+                "token_created": ""
+            }
         })
         cache[user["user_id"]] = now
         return await message.reply("✅ Verified! You now have access.")
@@ -184,12 +269,11 @@ async def handle_start(client, message):
     await client.send_video(
         chat_id=message.chat.id,
         video="https://envs.sh/2OS.mp4",
-        caption=(
-            f"👋 **Hello {name}**, I'm your Terabox Direct Download Bot!\n"
-            "📟 Just send me a Terabox link after verifying.\n\n"
-            "⏳ **Verification:** 24 hours\n📁 File Links only supported.\n\n"
-            "⏳ **By: @Silent_Bots** ")
-    )
+        caption=(f"👋 **Hello {name}**, I'm your Terabox Direct Download Bot!\n"
+                 "📟 Just send me a Terabox link after verifying.\n"
+                 "⏳ **Verification:** 24 hours\n\n"
+                 "⏳ **By: @Silent_Bots** "))
+
 
 @client.on_message(filters.command("check"))
 async def check_verification(client, message):
@@ -203,7 +287,11 @@ async def check_verification(client, message):
     mins = mins % 60
     await message.reply(f"⏳ Time left: {hours}h {mins}m")
 
-@client.on_message(filters.private & ~filters.command(["start", "check", "users", "broadcast", "up"]))
+
+# === Message Handler ===
+@client.on_message(
+    filters.private
+    & ~filters.command(["start", "check", "users", "broadcast", "up"]))
 async def handle_any_message(client, message):
     user_id = message.from_user.id
     if not is_verified(user_id):
@@ -214,19 +302,35 @@ async def handle_any_message(client, message):
     for url in matches:
         msg = await message.reply("🔍 Extracting direct download link...")
         try:
-            dlink, name, size, thumb = await terabox(url)
-            text = f"\n✅ **File:** {name}\n📦 **Size:** {size}\n"
-            buttons = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download ⬇️", url=dlink)]])
-            await client.send_photo(message.chat.id, thumb or "https://via.placeholder.com/500x300?text=No+Thumbnail", caption=text, reply_markup=buttons)
-            await client.send_photo(LOG_CHANNEL, thumb or "https://via.placeholder.com/500x300?text=No+Thumbnail", caption=(f"👤 [{message.from_user.first_name}](tg://user?id={message.from_user.id}) `{message.from_user.id}`\nSent: {url}\n{text}"), reply_markup=buttons)
+            files = await terabox(url)
+            for dlink, name, size, thumb in files:
+                text = f"\n✅ **File:** {name}\n📦 **Size:** {size}\n"
+                buttons = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬇️ Download ⬇️", url=dlink)]])
+                await client.send_photo(
+                    message.chat.id,
+                    thumb
+                    or "https://via.placeholder.com/500x300?text=No+Thumbnail",
+                    caption=text,
+                    reply_markup=buttons)
+                await client.send_photo(
+                    LOG_CHANNEL,
+                    thumb
+                    or "https://via.placeholder.com/500x300?text=No+Thumbnail",
+                    caption=
+                    (f"👤 [{message.from_user.first_name}](tg://user?id={message.from_user.id}) `{message.from_user.id}`\nSent: {url}\n{text}"
+                     ),
+                    reply_markup=buttons)
             await msg.delete()
         except Exception as e:
             await msg.edit(f"❌ Error: {str(e)}")
+
 
 @client.on_message(filters.command("users") & filters.user(OWNER_ID))
 async def handle_users(client, message):
     total = users.count_documents({"verified_at": {"$exists": True}})
     await message.reply(f"👥 Total Verified Users: `{total}`")
+
 
 @client.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast_handler(client, message):
@@ -241,7 +345,9 @@ async def broadcast_handler(client, message):
             success += 1
         except:
             failed += 1
-    await message.reply(f"✅ Broadcast finished!\n\nSent: `{success}`\nFailed: `{failed}`")
+    await message.reply(
+        f"✅ Broadcast finished!\n\nSent: `{success}`\nFailed: `{failed}`")
+
 
 @client.on_message(filters.command("up") & filters.user(OWNER_ID))
 async def update_cookie(client, message):
@@ -250,6 +356,7 @@ async def update_cookie(client, message):
         return await message.reply("❗ Usage: /up <new_cookie>")
     TERA_COOKIE = message.text.split(None, 1)[1].strip()
     await message.reply("✅ Cookie updated successfully.")
+
 
 print("Bot running...")
 client.run()
