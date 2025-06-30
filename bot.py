@@ -25,7 +25,7 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 TERABOX_DOMAINS = [
     "terabox.com", "terabox.app", "1024tera.com", "terasharelink.com",
     "nephobox.com", "1024terabox.com", "4funbox.com", "mirrobox.com",
-    "momerybox.com", "teraboxapp.com"
+    "momerybox.com", "teraboxapp.com","terafileshare.com"
 ]
 domain_pattern = "|".join(re.escape(domain) for domain in TERABOX_DOMAINS)
 url_pattern = re.compile(
