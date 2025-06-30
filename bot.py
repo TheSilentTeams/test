@@ -307,13 +307,15 @@ async def handle_any_message(client, message):
             files = await terabox(url)
             for dlink, name, size, thumb in files:
                 text = f"\n✅ **File:** {name}\n📦 **Size:** {size}\n"
-                proxy_link = f"https://thesilentteams.shivcollegelife.workers.dev/?url={quote_plus(dlink)}"
+                fixed_dlink = dlink.replace(".app", ".com")
+                proxy_link = f"https://thesilentteams.shivcollegelife.workers.dev/?url={quote_plus(fixed_dlink)}"
                 buttons = InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton("⬇️ Direct Link", url=dlink),
                         InlineKeyboardButton("⚡ Proxy Download", url=proxy_link)
                     ]
                 ])
+
                 await client.send_photo(
                     message.chat.id,
                     thumb
