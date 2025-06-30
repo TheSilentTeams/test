@@ -272,7 +272,7 @@ async def handle_start(client, message):
         video="https://envs.sh/2OS.mp4",
         caption=(f"👋 **Hello {name}**, I'm your Terabox Direct Download Bot!\n"
                  "📟 Just send me a Terabox link after verifying.\n"
-                 "⏳ **Verification:** 24 hours\n"
+                 "⏳ **Verification:** 24 hours\n\n"
                  " **Download** - Orginal Terabox Download link maybe need vpn\n **Proxy Download** - Slow but No need for vpn\n\n"
                  "⏳ **By: @Silent_Bots** "))
 
