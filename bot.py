@@ -1,10 +1,8 @@
 import os
 import re
-import secrets
 import aiohttp
-import urllib.parse
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from pymongo import MongoClient
 from pyrogram import Client, filters, utils
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -33,7 +31,6 @@ client = Client("verif_bot", api_id, api_hash, bot_token=bot_token)
 mongo = MongoClient(mongo_url)
 db = mongo["verifybot"]
 users = db["verified_users"]
-cache = {}
 
 def get_peer_type_new(peer_id: int) -> str:
     peer_id_str = str(peer_id)
@@ -45,64 +42,12 @@ def get_peer_type_new(peer_id: int) -> str:
 
 utils.get_peer_type = get_peer_type_new
 
-# === Verification ===
-VERIFICATION_DURATION = timedelta(hours=24)
-TOKEN_EXPIRY = timedelta(minutes=10)
-
+# === Verification Skipped ===
 def is_verified(user_id):
-    now = datetime.utcnow()
-    if user_id in cache:
-        return now - cache[user_id] < VERIFICATION_DURATION
-    record = users.find_one({"user_id": user_id})
-    if record and "verified_at" in record:
-        verified_at = record["verified_at"]
-        cache[user_id] = verified_at
-        return now - verified_at < VERIFICATION_DURATION
     return True
 
 def time_left(user_id):
-    if user_id in cache:
-        verified_at = cache[user_id]
-    else:
-        record = users.find_one({"user_id": user_id})
-        if not record or "verified_at" not in record:
-            return None
-        verified_at = record["verified_at"]
-        cache[user_id] = verified_at
-    now = datetime.utcnow()
-    delta = now - verified_at
-    if delta > VERIFICATION_DURATION:
-        return None
-    return VERIFICATION_DURATION - delta
-
-async def send_verification_prompt(client, user_id: int, chat_id: int):
-    token = secrets.token_urlsafe(16)
-    now = datetime.utcnow()
-    users.update_one({"user_id": user_id}, {
-        "$set": {"token": token, "token_created": now},
-        "$unset": {"verified_at": ""}
-    }, upsert=True)
-
-    deep_link = f"https://t.me/{client.me.username}?start=verify_{token}"
-    encoded_link = urllib.parse.quote(deep_link, safe='')
-    short_url = deep_link
-    try:
-        short_api = f"https://shortner.in/api?api={SHORTNER_API}&url={encoded_link}&format=text"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(short_api) as resp:
-                if resp.status == 200:
-                    result = await resp.text()
-                    if result.strip().startswith("http"):
-                        short_url = result.strip()
-    except Exception as e:
-        print("Shorten failed:", e)
-
-    text = "🔐 Please verify yourself by clicking below:"
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Verify Now", url=short_url)]]
-    )
-    await client.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
-    await client.send_message(LOG_CHANNEL, f"👤 [{chat_id}](tg://user?id={user_id}) requested verification\nLink: {short_url}")
+    return None
 
 # === TeraBox Downloader ===
 class DDLException(Exception):
@@ -156,58 +101,30 @@ async def terabox(url: str):
 # === Commands ===
 @client.on_message(filters.command("start"))
 async def handle_start(client, message):
-    args = message.text.split()
     name = message.from_user.first_name or message.from_user.username or "there"
     is_first = users.find_one({"user_id": message.from_user.id}) is None
 
     if is_first:
+        users.insert_one({"user_id": message.from_user.id})
         await client.send_message(LOG_CHANNEL, f"👤 New User: [{name}](tg://user?id={message.from_user.id}) `{message.from_user.id}`\nStarted bot.")
-
-    if len(args) == 2 and args[1].startswith("verify_"):
-        token = args[1].split("verify_")[1]
-        now = datetime.utcnow()
-        user = users.find_one({"token": token})
-        if not user:
-            return await message.reply("❌ Invalid or expired verification link.")
-        if "token_created" in user and now - user["token_created"] > TOKEN_EXPIRY:
-            return await message.reply("❌ Verification link expired.")
-        if user["user_id"] != message.from_user.id:
-            return await message.reply("❌ This link was not generated for you.")
-
-        users.update_one({"user_id": user["user_id"]}, {
-            "$set": {"verified_at": now},
-            "$unset": {"token": "", "token_created": ""}
-        })
-        cache[user["user_id"]] = now
-        return await message.reply("✅ Verified! You now have access.")
 
     await client.send_video(
         chat_id=message.chat.id,
         video="https://envs.sh/2OS.mp4",
         caption=(
             f"👋 **Hello {name}**, I'm your Terabox Direct Download Bot!\n"
-            "📟 Just send me a Terabox link after verifying.\n\n"
-            "⏳ **Verification:** 24 hours\n📁 File Links only supported.\n\n"
+            "📟 Just send me a Terabox link.\n\n"
+            "✅ **Verification Skipped in Dev Mode**\n"
+            "📁 File Links only supported.\n\n"
             "⏳ **By: @Silent_Bots** ")
     )
 
 @client.on_message(filters.command("check"))
 async def check_verification(client, message):
-    user_id = message.from_user.id
-    remaining = time_left(user_id)
-    if not remaining:
-        await message.reply("❌ Not verified or access expired.")
-        return await send_verification_prompt(client, user_id, message.chat.id)
-    mins = int(remaining.total_seconds() // 60)
-    hours = mins // 60
-    mins = mins % 60
-    await message.reply(f"⏳ Time left: {hours}h {mins}m")
+    await message.reply("✅ Verification skipped. You're good to go!")
 
 @client.on_message(filters.private & ~filters.command(["start", "check", "users", "broadcast", "up"]))
 async def handle_any_message(client, message):
-    user_id = message.from_user.id
-    if not is_verified(user_id):
-        return await send_verification_prompt(client, user_id, message.chat.id)
     matches = url_pattern.findall(message.text or "")
     if not matches:
         return await message.reply("❌ No valid TeraBox link found.")
@@ -225,15 +142,15 @@ async def handle_any_message(client, message):
 
 @client.on_message(filters.command("users") & filters.user(OWNER_ID))
 async def handle_users(client, message):
-    total = users.count_documents({"verified_at": {"$exists": True}})
-    await message.reply(f"👥 Total Verified Users: `{total}`")
+    total = users.count_documents({})
+    await message.reply(f"👥 Total Users: `{total}`")
 
 @client.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast_handler(client, message):
     if len(message.command) < 2:
         return await message.reply("❗ Usage: /broadcast <message>")
     text = message.text.split(None, 1)[1]
-    cursor = users.find({"verified_at": {"$exists": True}})
+    cursor = users.find({})
     success = failed = 0
     for user in cursor:
         try:
